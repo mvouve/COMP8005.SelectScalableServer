@@ -1,5 +1,8 @@
 package main
 
+// #include <sys/select.h>
+import "C"
+
 import (
 	"container/list"
 	"fmt"
@@ -8,14 +11,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
-
-	"github.com/creack/goselect"
 )
 
 type connectionInfo struct {
-	fileDescriptor     int
+	fileDescriptor     int       // connections file descriptor
 	timeStamp          time.Time // the time the connection ended
 	hostName           string    // the remote host name
 	ammountOfData      int       // the ammount of data transfered to/from the host
@@ -24,37 +27,50 @@ type connectionInfo struct {
 }
 
 type serverInfo struct {
-	serverConnection chan int
-	connectInfo      chan connectionInfo
-	listener         uintptr
+	serverConnection chan int            // channel used to inform main loop of new connections
+	connectInfo      chan connectionInfo // channel to connection info of closing connections to main loop
+	listener         int                 // listening socket
 }
 
 const newConnectionConst = 1
 const finishedConnectionConst = -1
 
-/* Author Marc Vouve
+/*******************************************************************************
+ * Author Marc Vouve
  *
  * Designer Marc Vouve
  *
  * Date: February 6 2016
  *
+ * Params: listenFd: The file descriptor of the listening host
+ *
+ * Return: connectionInfo of the new connection made
+ *
  * Notes: This is a helper function for when a new connection is detected by the
  *        observer loop
  *
- */
-func newConnection(listenFd uintptr) connectionInfo {
-	newFileDescriptor, socketAddr, _ := syscall.Accept(int(listenFd))
+ ******************************************************************************/
+func newConnection(listenFd int) (connectionInfo, error) {
+	newFileDescriptor, socketAddr, err := syscall.Accept(int(listenFd))
+	if err != nil {
+		return connectionInfo{}, err
+	}
+	if newFileDescriptor > 1024 {
+		syscall.Close(newFileDescriptor)
+	}
+	var hostname string
 	switch socketAddr := socketAddr.(type) {
 	default:
-		fmt.Printf("Unknown socket type %T \n", socketAddr)
+		return connectionInfo{}, err
 	case *syscall.SockaddrInet4:
-		hostname := net.IPv4(socketAddr.Addr[0], socketAddr.Addr[1], socketAddr.Addr[2], socketAddr.Addr[3]).String()
-		hostname += ":" + string(socketAddr.Port)
+		hostname = net.IPv4(socketAddr.Addr[0], socketAddr.Addr[1], socketAddr.Addr[2], socketAddr.Addr[3]).String()
+		hostname += ":" + strconv.FormatInt(int64(socketAddr.Port), 10)
 	case *syscall.SockaddrInet6:
-		hostname := net.IP(socketAddr.Addr[0:16])
+		hostname = net.IP(socketAddr.Addr[0:16]).String()
+		hostname += ":" + string(socketAddr.Port)
 	}
 
-	return connectionInfo{fileDescriptor: newFileDescriptor}
+	return connectionInfo{fileDescriptor: newFileDescriptor, hostName: hostname}, nil
 }
 
 /* Author: Marc Vouve
@@ -68,49 +84,55 @@ func newConnection(listenFd uintptr) connectionInfo {
  *        for annother connection
  */
 func serverInstance(srvInfo serverInfo) {
-	fdSet := new(goselect.FDSet)
-
+	//fdSet := new(C.fd_set)
+	fdSet := new(syscall.FdSet)
 	client := make(map[connectionInfo]bool)
-	highClient := -1
+	highClient := srvInfo.listener
+	time := syscall.Timeval{Sec: 100}
 
-	// goselect library omits nready, select call using syscall
-	nready, err := syscall.Select(highClient, (*syscall.FdSet)(fdSet), nil, nil, nil)
-	if err != nil {
-		log.Println(err)
+	FD_ZERO(fdSet)
+	FD_SET(fdSet, srvInfo.listener)
 
-		return // block shouldn't be hit under normal conditions.
-	}
-	for conn, active := range client {
-		if !active {
-			continue
+	for {
+		fmt.Println(highClient)
+		// goselect library omits nready, select call using syscall
+		_, err := syscall.Select(highClient+1, fdSet, nil, nil, &time)
+		if err != nil {
+			log.Println("err", err)
+			return // block shouldn't be hit under normal conditions. If it does something is really wrong.
 		}
-		if fdSet.IsSet(srvInfo.listener) {
-			// add socket to queue
-
-			client[newConnection(srvInfo.listener)] = true
-			fdSet.Clear(srvInfo.listener)
-		}
-		socketfd := conn.fileDescriptor
-
-		if fdSet.IsSet(uintptr(socketfd)) {
-			nready--
-			read, err := handleData(uintptr(socketfd))
-			if err == io.EOF {
-				srvInfo.connectInfo <- conn
-				delete(client, conn)
-			} else if err != nil {
-				log.Println(err)
-				// also deal with closing
-			} else {
-				conn.ammountOfData += read
-				conn.numberOfRequests++
-				fdSet.Clear(uintptr(conn.fileDescriptor))
+		if FD_ISSET(fdSet, srvInfo.listener) { // new client
+			newClient, err := newConnection(srvInfo.listener)
+			if err == nil {
+				client[newClient] = true
+				FD_SET(fdSet, newClient.fileDescriptor)
+				if newClient.fileDescriptor > highClient {
+					highClient = newClient.fileDescriptor
+				}
 			}
 		}
-		if nready <= 0 {
-			break
+		for conn := range client {
+			socketfd := conn.fileDescriptor
+			if FD_ISSET(fdSet, socketfd) { // existing connection
+				read, err := handleData(socketfd)
+				if err != nil {
+					if err != io.EOF {
+						log.Println(err)
+					}
+					endConnection(srvInfo, conn)
+					delete(client, conn)
+				} else {
+					conn.ammountOfData += read
+					conn.numberOfRequests++
+				}
+			}
 		}
 	}
+}
+
+func endConnection(srvInfo serverInfo, conn connectionInfo) {
+	srvInfo.connectInfo <- conn
+	syscall.Close(conn.fileDescriptor)
 }
 
 /* Author: Marc Vouve
@@ -145,24 +167,27 @@ func connectionInstance(conn net.Conn) connectionInfo {
 }
 
 /**/
-func handleData(fd uintptr) (int, error) {
+func handleData(fd int) (int, error) {
 	buf := make([]byte, 1024)
-	msg := make([]byte, 0, 1024)
-	totalRead := 0
+	var msg string
+	fmt.Println("reading")
+
 	for {
-		read, err := syscall.Read(int(fd), buf[:])
+		n, err := syscall.Read(fd, buf[:])
 		if err != nil {
 			return 0, err
 		}
-		msg = append(msg, buf[:read]...)
-		if buf[read] == '\n' {
+
+		msg += string(buf[:n])
+
+		if strings.ContainsRune(msg, '\n') {
+			fmt.Print(msg)
 			break
 		}
-		totalRead += read
 	}
-	syscall.Write(int(fd), msg)
+	syscall.Write(fd, []byte(msg))
 
-	return totalRead, nil
+	return len(msg), nil
 }
 
 /* Author: Marc Vouve
@@ -203,19 +228,20 @@ func newServerInfo() serverInfo {
 	if err != nil {
 		log.Println(err)
 	}
-	syscall.SetNonblock(fd, true)
+	syscall.SetNonblock(fd, false)
 	// TODO: make port vairable
+	strconv.Atoi(string(os.Args[1]))
 	addr := syscall.SockaddrInet4{Port: 2000}
 	copy(addr.Addr[:], net.ParseIP("0.0.0.0").To4())
 	syscall.Bind(fd, &addr)
 	syscall.Listen(fd, 1000)
-	srvInfo.listener = uintptr(fd)
+	srvInfo.listener = fd
 
 	return srvInfo
 }
 
 func (s serverInfo) Close() {
-	syscall.Close(int(s.listener))
+	syscall.Close(s.listener)
 }
 
 func main() {
@@ -238,4 +264,35 @@ func main() {
 	signal.Notify(osSignals, os.Interrupt, os.Kill)
 
 	observerLoop(srvInfo, osSignals)
+}
+
+/**FD_SET
+ * Emulates system macros for select
+ *
+ * @author Mindreframer - https://github.com/mindreframer/
+ *
+ * @desginer unknown
+ *
+ * @notes:
+ * Emulates the system call macros missing from golang
+ * Retreived from: https://github.com/mindreframer/golang-stuff/blob/master/github.com/pebbe/zmq2/examples/udpping1.go
+ */
+func FD_SET(p *syscall.FdSet, i int) {
+	p.Bits[i/64] |= 1 << uint(i) % 64
+}
+
+func FD_CLR(p *syscall.FdSet, i int) {
+	if FD_ISSET(p, i) {
+		p.Bits[i/64] ^= 1 << uint(i) % 64
+	}
+}
+
+func FD_ISSET(p *syscall.FdSet, i int) bool {
+	return (p.Bits[i/64] & (1 << uint(i) % 64)) != 0
+}
+
+func FD_ZERO(p *syscall.FdSet) {
+	for i := range p.Bits {
+		p.Bits[i] = 0
+	}
 }
