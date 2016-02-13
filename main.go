@@ -1,7 +1,6 @@
-package main
+// +build linux
 
-// #include <sys/select.h>
-import "C"
+package main
 
 import (
 	"container/list"
@@ -34,6 +33,7 @@ type serverInfo struct {
 
 const newConnectionConst = 1
 const finishedConnectionConst = -1
+const selectMax = 2048 * 64
 
 /*******************************************************************************
  * Author Marc Vouve
@@ -55,9 +55,7 @@ func newConnection(listenFd int) (connectionInfo, error) {
 	if err != nil {
 		return connectionInfo{}, err
 	}
-	if newFileDescriptor > 1024 {
-		syscall.Close(newFileDescriptor)
-	}
+
 	var hostname string
 	switch socketAddr := socketAddr.(type) {
 	default:
@@ -69,7 +67,6 @@ func newConnection(listenFd int) (connectionInfo, error) {
 		hostname = net.IP(socketAddr.Addr[0:16]).String()
 		hostname += ":" + string(socketAddr.Port)
 	}
-
 	return connectionInfo{fileDescriptor: newFileDescriptor, hostName: hostname}, nil
 }
 
@@ -85,27 +82,28 @@ func newConnection(listenFd int) (connectionInfo, error) {
  */
 func serverInstance(srvInfo serverInfo) {
 	//fdSet := new(C.fd_set)
-	fdSet := new(syscall.FdSet)
+	var fdSet, rSet syscall.FdSet
 	client := make(map[connectionInfo]bool)
 	highClient := srvInfo.listener
-	time := syscall.Timeval{Sec: 100}
+	timeout := syscall.Timeval{Sec: 1}
 
-	FD_ZERO(fdSet)
-	FD_SET(fdSet, srvInfo.listener)
+	FD_ZERO(&fdSet)
+	FD_SET(&fdSet, srvInfo.listener)
 
 	for {
-		fmt.Println(highClient)
-		// goselect library omits nready, select call using syscall
-		_, err := syscall.Select(highClient+1, fdSet, nil, nil, &time)
+		timeout.Sec = 1
+		copy(rSet.Bits[:], fdSet.Bits[:])
+		_, err := syscall.Select(highClient+1, &rSet, nil, nil, &timeout)
 		if err != nil {
 			log.Println("err", err)
 			return // block shouldn't be hit under normal conditions. If it does something is really wrong.
 		}
-		if FD_ISSET(fdSet, srvInfo.listener) { // new client
+		if FD_ISSET(&rSet, srvInfo.listener) { // new client
 			newClient, err := newConnection(srvInfo.listener)
 			if err == nil {
 				client[newClient] = true
-				FD_SET(fdSet, newClient.fileDescriptor)
+				FD_SET(&fdSet, newClient.fileDescriptor)
+				srvInfo.serverConnection <- 1
 				if newClient.fileDescriptor > highClient {
 					highClient = newClient.fileDescriptor
 				}
@@ -113,12 +111,13 @@ func serverInstance(srvInfo serverInfo) {
 		}
 		for conn := range client {
 			socketfd := conn.fileDescriptor
-			if FD_ISSET(fdSet, socketfd) { // existing connection
+			if FD_ISSET(&rSet, socketfd) { // existing connection
 				read, err := handleData(socketfd)
 				if err != nil {
 					if err != io.EOF {
 						log.Println(err)
 					}
+					FD_CLR(&fdSet, conn.fileDescriptor)
 					endConnection(srvInfo, conn)
 					delete(client, conn)
 				} else {
@@ -135,53 +134,23 @@ func endConnection(srvInfo serverInfo, conn connectionInfo) {
 	syscall.Close(conn.fileDescriptor)
 }
 
-/* Author: Marc Vouve
- *
- * Designer: Marc Vouve
- *
- * Date: February 6 2016
- *
- * Returns: connectionInfo information about the connection once the client has
- *          terminated the client.
- *
- * Notes: This function handles actual connections made to the server and tracks
- *        data about the ammount of data and the number of times data is set to
- *        the server.
- *
-func connectionInstance(conn net.Conn) connectionInfo {
-	connInfo := connectionInfo{hostName: conn.RemoteAddr().String()}
-
-	for {
-		err := handleData(conn, &connInfo)
-		if err == nil {
-			continue
-		} else if err == io.EOF {
-			break
-		}
-		log.Println(err)
-		break
-	}
-	connInfo.timeStamp = time.Now()
-
-	return connInfo
-}
-
 /**/
 func handleData(fd int) (int, error) {
 	buf := make([]byte, 1024)
 	var msg string
-	fmt.Println("reading")
 
 	for {
 		n, err := syscall.Read(fd, buf[:])
 		if err != nil {
 			return 0, err
 		}
+		if n == 0 {
+			return len(msg), io.EOF
+		}
 
 		msg += string(buf[:n])
 
 		if strings.ContainsRune(msg, '\n') {
-			fmt.Print(msg)
 			break
 		}
 	}
@@ -213,6 +182,7 @@ func observerLoop(srvInfo serverInfo, osSignals chan os.Signal) {
 			serverHost.connectionsAtClose = currentConnections
 			connectionsMade.PushBack(serverHost)
 			currentConnections--
+			fmt.Println(currentConnections)
 		case <-osSignals:
 			generateReport(time.Now().String(), connectionsMade)
 			fmt.Println("Total connections made:", connectionsMade.Len())
@@ -278,17 +248,15 @@ func main() {
  * Retreived from: https://github.com/mindreframer/golang-stuff/blob/master/github.com/pebbe/zmq2/examples/udpping1.go
  */
 func FD_SET(p *syscall.FdSet, i int) {
-	p.Bits[i/64] |= 1 << uint(i) % 64
+	p.Bits[i/64] |= (1 << (uint(i) % 64))
 }
 
 func FD_CLR(p *syscall.FdSet, i int) {
-	if FD_ISSET(p, i) {
-		p.Bits[i/64] ^= 1 << uint(i) % 64
-	}
+	p.Bits[i/64] &^= (1 << (uint(i) % 64))
 }
 
 func FD_ISSET(p *syscall.FdSet, i int) bool {
-	return (p.Bits[i/64] & (1 << uint(i) % 64)) != 0
+	return (p.Bits[i/64] & (1 << (uint(i) % 64))) != 0
 }
 
 func FD_ZERO(p *syscall.FdSet) {
