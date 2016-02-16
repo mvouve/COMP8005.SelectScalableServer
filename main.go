@@ -1,28 +1,45 @@
-// +build linux
+/*------------------------------------------------------------------------------
+-- DATE:	       February, 2016
+--
+-- Source File:	 main.go
+--
+-- REVISIONS: 	(Date and Description)
+--
+-- DESIGNER:	   Marc Vouve
+--
+-- PROGRAMMER:	 Marc Vouve
+--
+--
+-- INTERFACE:
+--  func main()
+--	func manageConnections(srvInfo serverInfo, osSignals chan os.Signal)
+--	func newServerInfo() serverInfo
+--  func getAddr() syscall.SockaddrInet4
+--  func (s serverInfo) Close()
+--
+-- NOTES: This is the main file for the select scalable server
+------------------------------------------------------------------------------*/
 
 package main
 
 import (
 	"container/list"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 )
 
 type connectionInfo struct {
-	fileDescriptor     int       // connections file descriptor
-	timeStamp          time.Time // the time the connection ended
-	hostName           string    // the remote host name
-	ammountOfData      int       // the ammount of data transfered to/from the host
-	numberOfRequests   int       // the total requests sent to the server from this client
-	connectionsAtClose int       // the total number of connections being sustained when the connection was closed.
+	FileDescriptor     int    // connections file descriptorS
+	HostName           string // the remote host name
+	AmmountOfData      int    // the ammount of data transfered to/from the host
+	NumberOfRequests   int    // the total requests sent to the server from this client
+	ConnectionsAtClose int    // the total number of connections being sustained when the connection was closed.
 }
 
 type serverInfo struct {
@@ -34,186 +51,25 @@ type serverInfo struct {
 const newConnectionConst = 1
 const finishedConnectionConst = -1
 const selectMax = 2048 * 64
+const backlog = 10000
 
-/*******************************************************************************
- * Author Marc Vouve
- *
- * Designer Marc Vouve
- *
- * Date: February 6 2016
- *
- * Params: listenFd: The file descriptor of the listening host
- *
- * Return: connectionInfo of the new connection made
- *
- * Notes: This is a helper function for when a new connection is detected by the
- *        observer loop
- *
- ******************************************************************************/
-func newConnection(listenFd int) (connectionInfo, error) {
-	newFileDescriptor, socketAddr, err := syscall.Accept(int(listenFd))
-	if err != nil {
-		return connectionInfo{}, err
-	}
-
-	var hostname string
-	switch socketAddr := socketAddr.(type) {
-	default:
-		return connectionInfo{}, err
-	case *syscall.SockaddrInet4:
-		hostname = net.IPv4(socketAddr.Addr[0], socketAddr.Addr[1], socketAddr.Addr[2], socketAddr.Addr[3]).String()
-		hostname += ":" + strconv.FormatInt(int64(socketAddr.Port), 10)
-	case *syscall.SockaddrInet6:
-		hostname = net.IP(socketAddr.Addr[0:16]).String()
-		hostname += ":" + string(socketAddr.Port)
-	}
-	return connectionInfo{fileDescriptor: newFileDescriptor, hostName: hostname}, nil
-}
-
-/* Author: Marc Vouve
- *
- * Designer: Marc Vouve
- *
- * Date: February 6 2016
- *
- * Notes: This function is an "instance" of a server which allows connections in
- *        and echos strings back. After a connection has been closed it will wait
- *        for annother connection
- */
-func serverInstance(srvInfo serverInfo) {
-	//fdSet := new(C.fd_set)
-	var fdSet, rSet syscall.FdSet
-	client := make(map[connectionInfo]bool)
-	highClient := srvInfo.listener
-	timeout := syscall.Timeval{Sec: 1}
-
-	FD_ZERO(&fdSet)
-	FD_SET(&fdSet, srvInfo.listener)
-
-	for {
-		timeout.Sec = 1
-		copy(rSet.Bits[:], fdSet.Bits[:])
-		_, err := syscall.Select(highClient+1, &rSet, nil, nil, &timeout)
-		if err != nil {
-			log.Println("err", err)
-			return // block shouldn't be hit under normal conditions. If it does something is really wrong.
-		}
-		if FD_ISSET(&rSet, srvInfo.listener) { // new client
-			newClient, err := newConnection(srvInfo.listener)
-			if err == nil {
-				client[newClient] = true
-				FD_SET(&fdSet, newClient.fileDescriptor)
-				srvInfo.serverConnection <- 1
-				if newClient.fileDescriptor > highClient {
-					highClient = newClient.fileDescriptor
-				}
-			}
-		}
-		for conn := range client {
-			socketfd := conn.fileDescriptor
-			if FD_ISSET(&rSet, socketfd) { // existing connection
-				read, err := handleData(socketfd)
-				if err != nil {
-					if err != io.EOF {
-						log.Println(err)
-					}
-					FD_CLR(&fdSet, conn.fileDescriptor)
-					endConnection(srvInfo, conn)
-					delete(client, conn)
-				} else {
-					conn.ammountOfData += read
-					conn.numberOfRequests++
-				}
-			}
-		}
-	}
-}
-
-func endConnection(srvInfo serverInfo, conn connectionInfo) {
-	srvInfo.connectInfo <- conn
-	syscall.Close(conn.fileDescriptor)
-}
-
-/**/
-func handleData(fd int) (int, error) {
-	buf := make([]byte, 1024)
-	var msg string
-
-	for {
-		n, err := syscall.Read(fd, buf[:])
-		if err != nil {
-			return 0, err
-		}
-		if n == 0 {
-			return len(msg), io.EOF
-		}
-
-		msg += string(buf[:n])
-
-		if strings.ContainsRune(msg, '\n') {
-			break
-		}
-	}
-	syscall.Write(fd, []byte(msg))
-
-	return len(msg), nil
-}
-
-/* Author: Marc Vouve
- *
- * Designer: Marc Vouve
- *
- * Date: February 7 2016
- *
- * Returns: connectionInfo information about the connection once the client has
- *          terminated the client.
- *
- * Notes: This was factored out of the main function.
- */
-func observerLoop(srvInfo serverInfo, osSignals chan os.Signal) {
-	currentConnections := 0
-	connectionsMade := list.New()
-
-	for {
-		select {
-		case <-srvInfo.serverConnection:
-			currentConnections++
-		case serverHost := <-srvInfo.connectInfo:
-			serverHost.connectionsAtClose = currentConnections
-			connectionsMade.PushBack(serverHost)
-			currentConnections--
-			fmt.Println(currentConnections)
-		case <-osSignals:
-			generateReport(time.Now().String(), connectionsMade)
-			fmt.Println("Total connections made:", connectionsMade.Len())
-			os.Exit(1)
-		}
-	}
-}
-
-func newServerInfo() serverInfo {
-	srvInfo := serverInfo{
-		serverConnection: make(chan int, 10), connectInfo: make(chan connectionInfo)}
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.O_NONBLOCK|syscall.SOCK_STREAM, 0)
-	if err != nil {
-		log.Println(err)
-	}
-	syscall.SetNonblock(fd, false)
-	// TODO: make port vairable
-	strconv.Atoi(string(os.Args[1]))
-	addr := syscall.SockaddrInet4{Port: 2000}
-	copy(addr.Addr[:], net.ParseIP("0.0.0.0").To4())
-	syscall.Bind(fd, &addr)
-	syscall.Listen(fd, 1000)
-	srvInfo.listener = fd
-
-	return srvInfo
-}
-
-func (s serverInfo) Close() {
-	syscall.Close(s.listener)
-}
-
+/*-----------------------------------------------------------------------------
+-- FUNCTION:    main
+--
+-- DATE:        February 6, 2016
+--
+-- REVISIONS:	  February 11, 2016 Modified for Select
+--
+-- DESIGNER:		Marc Vouve
+--
+-- PROGRAMMER:	Marc Vouve
+--
+-- INTERFACE:   func main()
+--
+-- RETURNS:     void
+--
+-- NOTES:			The main entry point for the scalable server.
+------------------------------------------------------------------------------*/
 func main() {
 	if len(os.Args) < 2 { // validate args
 		fmt.Println("Missing args:", os.Args[0], " [PORT]")
@@ -225,7 +81,7 @@ func main() {
 	defer srvInfo.Close()
 
 	// create servers
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 16; i++ {
 		go serverInstance(srvInfo)
 	}
 
@@ -236,31 +92,126 @@ func main() {
 	observerLoop(srvInfo, osSignals)
 }
 
-/**FD_SET
- * Emulates system macros for select
- *
- * @author Mindreframer - https://github.com/mindreframer/
- *
- * @desginer unknown
- *
- * @notes:
- * Emulates the system call macros missing from golang
- * Retreived from: https://github.com/mindreframer/golang-stuff/blob/master/github.com/pebbe/zmq2/examples/udpping1.go
- */
-func FD_SET(p *syscall.FdSet, i int) {
-	p.Bits[i/64] |= (1 << (uint(i) % 64))
-}
+/*-----------------------------------------------------------------------------
+-- FUNCTION:    manageConnections
+--
+-- DATE:        February 6, 2016
+--
+-- REVISIONS:	  February 11, 2016 Modified for Select
+--
+-- DESIGNER:		Marc Vouve
+--
+-- PROGRAMMER:	Marc Vouve
+--
+-- INTERFACE:   func manageConnections(srvInfo serverInfo, osSignals chan os.Signal)
+--	 srvInfo:   information about the server (IPC and listening port)
+-- osSignals:	  listens for signals from the OS that should stop the server from running
+--
+-- RETURNS:     void
+--
+-- NOTES:			This server will loop until inturupted by an OS Signal on soSignals.
+------------------------------------------------------------------------------*/
+func observerLoop(srvInfo serverInfo, osSignals chan os.Signal) {
+	currentConnections := 0
+	connectionsMade := list.New()
 
-func FD_CLR(p *syscall.FdSet, i int) {
-	p.Bits[i/64] &^= (1 << (uint(i) % 64))
-}
-
-func FD_ISSET(p *syscall.FdSet, i int) bool {
-	return (p.Bits[i/64] & (1 << (uint(i) % 64))) != 0
-}
-
-func FD_ZERO(p *syscall.FdSet) {
-	for i := range p.Bits {
-		p.Bits[i] = 0
+	for {
+		select {
+		case <-srvInfo.serverConnection:
+			currentConnections++
+		case serverHost := <-srvInfo.connectInfo:
+			serverHost.ConnectionsAtClose = currentConnections
+			connectionsMade.PushBack(serverHost)
+			currentConnections--
+		case <-osSignals:
+			generateReport(time.Now().String(), connectionsMade)
+			fmt.Println("Total connections made:", connectionsMade.Len())
+			os.Exit(1)
+		}
 	}
+}
+
+/*-----------------------------------------------------------------------------
+-- FUNCTION:    newServer Info
+--
+-- DATE:        February 7, 2016
+--
+-- REVISIONS:	  February 11, 2016 Modified for select
+--
+--
+-- DESIGNER:		Marc Vouve
+--
+-- PROGRAMMER:	Marc Vouve
+--
+-- INTERFACE:   func newServerInfo() serverInfo
+--
+-- RETURNS:     serverInfo for the current session.
+--
+-- NOTES:			this function should probably only be called once, as it controls a
+--						lot of the IPC in the program.
+------------------------------------------------------------------------------*/
+func newServerInfo() serverInfo {
+	srvInfo := serverInfo{serverConnection: make(chan int, 100), connectInfo: make(chan connectionInfo, 100)}
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.O_NONBLOCK|syscall.SOCK_STREAM, 0)
+	if err != nil {
+		log.Println(err)
+	}
+	syscall.SetNonblock(fd, true)
+	// TODO: make port vairable
+	addr := getAddr()
+	syscall.Bind(fd, &addr)
+	syscall.Listen(fd, backlog)
+	srvInfo.listener = fd
+
+	return srvInfo
+}
+
+/*-----------------------------------------------------------------------------
+-- FUNCTION:    getAddr
+--
+-- DATE:        February 11, 2016
+--
+--
+-- DESIGNER:		Marc Vouve
+--
+-- PROGRAMMER:	Marc Vouve
+--
+-- INTERFACE:   getAddr() syscall.SockaddrInet4
+--
+-- RETURNS:     syscall.SockaddrInet4 a sockaddr of the port specified by the user.
+--
+-- NOTES:			  this funciton parses a port out of user input
+------------------------------------------------------------------------------*/
+func getAddr() syscall.SockaddrInet4 {
+	port, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		log.Fatal("Port must be declaired as [PORT]")
+	}
+	addr := syscall.SockaddrInet4{Port: port}
+	copy(addr.Addr[:], net.ParseIP("0.0.0.0").To4())
+
+	return addr
+}
+
+/*-----------------------------------------------------------------------------
+-- FUNCTION:    close
+--
+-- DATE:        February 7, 2016
+--
+-- REVISIONS:	  February 11, 2016 Modified for EPoll
+--
+--
+-- DESIGNER:		Marc Vouve
+--
+-- PROGRAMMER:	Marc Vouve
+--
+-- INTERFACE:   func (s serverInfo) Close()
+--
+-- RETURNS:     void
+--
+-- NOTES:			  This function closes everything that must be closed in serverInfo
+--							upon program termination. currently just the listener
+------------------------------------------------------------------------------*/
+func (s serverInfo) Close() {
+	syscall.Close(s.listener)
 }
