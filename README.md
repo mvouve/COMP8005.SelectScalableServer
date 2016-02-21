@@ -16,7 +16,7 @@ When terminated, the process will exit and generate an XLSX report listing clien
 ##Testing
 This program has been tested to work on Fedora 22 and Manjaro 15 using a modified Go 1.5 compiler. It has been able to sustain over 40k concurrent connections.
 
-In order to monitor over 1024 file descriptors using select in Go, the compiler must be modified, in the syscall/ztypes_[os]_[arch].go:
+In order to monitor over 1024 file descriptors using select in Go, the compiler must be modified, in syscall/ztypes_[os]_[arch].go:
 ```go
 type FdSet struct {
  Bits [16]int64
