@@ -28,4 +28,4 @@ type FdSet struct {
  Bits [2048]int64
 }
 ```
-Likely this will not pass the API test when compiled, and tests will also have to be modified.
+Likely this will not pass the API test when compiled (rightly so, as the Go API specifies that FdSet is 1024bits), and tests will also have to be modified.
